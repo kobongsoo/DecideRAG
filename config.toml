@@ -1,0 +1,158 @@
+# DecideRAG 설정 — BM25 검색 + decide 판단 + Qwen 답변
+# 흐름: 추출 → 청킹 → BM25 → decide 판단(재정렬·충분성·재검색 계획) → 재검색 → Qwen 답변
+
+[paths]
+# 색인할 문서 폴더
+doc_dir = 'D:\Project\Q&A\dataset\doc'
+# 추출 결과·청크·색인을 두는 폴더 (상대 경로면 프로젝트 폴더 기준)
+data_dir = 'data'
+# 질문별 trace 로그 폴더
+log_dir = 'logs'
+
+[docparse]
+# 0.3.0 (5단계). 0.2.0 과 블록이 같음을 18개 문서로 확인했다. 쪽 OCR(ocr_file)을 숫자 빠짐 보정에 쓴다
+dll = 'D:\Project\Struct-DocParse-OCR-rust\dist\struct_docparse-0.3.0-792fa93-windows-x64\lib\struct_docparse.dll'
+binding_dir = 'D:\Project\Struct-DocParse-OCR-rust\dist\struct_docparse-0.3.0-792fa93-windows-x64\bindings\python'
+ocr_mode = "inline"
+ocr_threads = 4
+# PDF 글자층에서 숫자가 빠진 쪽("제 조제 항", "회 만원")만 OCR 해 블록에 숫자를 채운다 (설계서 4.1·14.5)
+# OCR 은 이 PC 에서 쪽당 약 2~4초. 결과는 data\ocr\<내용 해시>.json 에 두고 다시 쓴다
+fix_missing_digits = true
+
+[llm]
+url = "http://192.168.0.14:8082"
+model = "mlx-community/Qwen3.6-35B-A3B-4bit"
+timeout_sec = 300
+enable_thinking = false
+max_tokens = 400
+# 연결 대기(초)와 재시도 횟수. 실패하면 /ask 는 근거 목록과 함께 502
+connect_timeout_sec = 3
+retries = 1
+
+[decide]
+url = "http://10.10.4.10:18004"
+# API 키는 여기에 쓰지 않는다. 환경변수 DECIDE_API_KEY 가 있으면 우선, 없으면 이 파일 첫 줄
+api_key_file = 'D:\Project\decide\.secrets\decide_api_key'
+timeout_sec = 60
+# decide 에 넣을 청크 글자 수 상한 (입력 한도 20,480 토큰)
+chunk_clip = 1200
+# 장애 처리 (설계서 8.2): 연결 대기 3초, 재시도 2회(0.5초 → 1초 쉼). 그래도 실패하면 판단 없이 답한다 (degraded)
+connect_timeout_sec = 3
+retries = 2
+backoff_sec = 0.5
+# 실패 후 이 시간 동안은 decide 를 부르지 않고 바로 degraded 로 답한다 (꺼진 서버를 질문마다 기다리지 않게)
+cooldown_sec = 30
+# decide 대기열 상한 (한 번에 한 요청만 처리하므로 줄을 세운다). 넘으면 /ask 503
+max_queue = 50
+
+[chunk]
+max_chars = 700
+min_chars = 150
+
+[search]
+# "opensearch" (운영) 또는 "memory" (rank_bm25, 문서 수천 개 이하 시험용)
+engine = "opensearch"
+url = "http://127.0.0.1:9200"
+# 색인 이름 = <prefix>_chunks, <prefix>_docs
+index_prefix = "decide"
+timeout_sec = 10
+# https 자체 서명 인증서면 false. 인증은 환경변수 OPENSEARCH_USER / OPENSEARCH_PASSWORD (여기 쓰지 않는다)
+verify_tls = true
+
+[index]
+# 문서 색인 글(라우팅 후보 검색용)에 넣을 첫 청크 본문 글자 수 (설계서 12.1)
+doc_first_chars = 300
+# 문서별 열람 그룹 규칙 파일 (경로 패턴 → 그룹). 맞는 규칙이 없는 문서는 default_acl
+acl_file = "acl.toml"
+default_acl = ["all"]
+
+[service]
+host = "127.0.0.1"
+port = 8090
+# 모든 사용자가 자동으로 갖는 공개 그룹 / 색인 명령을 쓸 수 있는 그룹
+public_group = "all"
+admin_group = "admin"
+# 인증 게이트웨이와 나눠 가진 토큰을 담은 환경변수 이름 (토큰 값은 여기 쓰지 않는다)
+gateway_token_env = "DECIDE_GATEWAY_TOKEN"
+# 토큰 환경변수가 없을 때 이 PC 시험용으로만 켠다 (헤더는 무시하고 아래 사용자로 동작)
+dev_mode = false
+dev_user = "dev"
+dev_groups = []
+# 질문별 trace 를 logs\trace_YYYYMMDD.jsonl 에 남긴다
+trace = true
+
+[retrieval]
+# 1라운드 BM25 후보 수
+bm25_top_k = 10
+# 재검색 질의 하나당 후보 수
+research_top_k = 5
+# 재검색 한 번에 새로 판단할 청크 최대 수
+research_new_max = 10
+# 답변에 넣을 청크 수
+context_k = 5
+
+[agent]
+# 첫 검색 + 재검색 최대 2회
+max_rounds = 3
+# 질문당 decide 호출 상한 (다음 라운드를 시작하기 전에 확인)
+max_decide_calls = 40
+# 다음 라운드를 시작하기 전 판단 시간 예산 (초)
+judge_budget_sec = 6.0
+# 충분성 확률이 이 값 이상이면 재검색을 멈추고 답변
+suff_threshold = 0.5
+# 문서 라우팅에서 고를 문서 수와 2순위부터의 최소 확률
+route_top_docs = 2
+route_min_prob = 0.05
+# decide 에 보여 줄 라우팅 후보 문서 수 상한 (근거 문서 + 문서 BM25 상위, 설계서 12.1)
+route_candidates = 20
+# PRF 확장어 수
+prf_terms = 5
+# 검색 질의에 이어 붙일 최근 이전 사용자 질문 수 (0 = 전부)
+history_turns = 2
+# true 면 마지막까지 근거 부족 시 LLM 을 부르지 않고 "찾을 수 없음" 으로 답한다
+refuse_when_insufficient = false
+
+[answer]
+# 4단계 답 고치기 (설계서 10장, 결과 14.4). 켜고 끄는 값은 평가 결과로 정했다: A3·A4 켬, A1·A2 끔
+# A1: decide 가 "계산·조건 비교가 필요한 질문" 이라고 본 질문만 Qwen 생각 모드로 답한다
+# 끔: 정답률 차이 -0.003 [-0.025, +0.021], 답변 시간 평균 0.76 → 6.2초 (14.4)
+thinking_on_reasoning = false
+thinking_min_prob = 0.3
+# 생각 토큰까지 포함한 한도. 넘어서 답이 비면 생각 모드 없이 다시 답한다
+thinking_max_tokens = 4000
+# A2: 답에 근거·질문에 없는 숫자가 있으면 근거 숫자로 계산식을 쓰고 다시 답하게 한다
+# 끔: 정답률이 오르지 않았다. 차이 -0.003 [-0.010, +0.003] (14.4)
+verify_numbers = false
+# A3: 충분성이 이 값 이상인데 거절하면 가장 관련 높은 근거 번호를 짚어 다시 답하게 한다
+# 켬: 오거절 5.6% → 2.2% (A3+A4), 문서에 없는 질문 거절 100% 유지 (14.4)
+retry_refusal = true
+retry_refusal_min_suff = 0.8
+# A4: 답의 한자 비율(한자 / (한글+한자))이 이 값을 넘으면 한국어로 다시 쓰게 한다
+# 켬: 중국어 답 1건(B004)을 한국어로. 걸린 문항만 LLM 1회 추가
+force_korean = true
+max_han_ratio = 0.2
+
+[vector]
+# 검색 경로 (7단계, 설계서 2.1 · 4.3.1~4.3.3): BM25 + 벡터(BGE-m3-ko, OpenSearch k-NN) → RRF → 리랭커 → decide
+# enabled 를 바꾸면 다음 build 가 모든 문서를 다시 색인한다 (manifest 의 embed 표시가 달라지므로)
+enabled = true
+dim = 1024
+# 임베딩 서버 (A30, vLLM dragonkue/BGE-m3-ko). 청크 임베딩 캐시: data\vectors\<embed_model>.npz
+embed_url = "http://10.10.4.10:18002"
+embed_model = "bge-m3-ko"
+# RRF 에 넣을 검색기별 후보 수와 RRF 상수 (프로토타입과 같음)
+pool = 20
+rrf_k = 60
+# 리랭커 서버 (A30, vLLM bge-reranker-v2-m3-ko). 검색 요청마다 후보 rerank_candidates 개를 다시 줄 세운다
+rerank_enabled = true
+reranker_url = "http://10.10.4.10:18003"
+reranker_model = "bge-reranker-v2-m3-ko"
+rerank_candidates = 20
+# 임베딩·리랭커 응답 대기(초)와, 실패 후 그 단계를 건너뛸 시간(초). 건너뛰면 degraded 에 이유가 남는다 (설계서 8.2)
+timeout_sec = 10
+cooldown_sec = 30
+# ── 아래는 구성 비교 스크립트(eval\compare_configs.py)만 쓴다 ──
+# e5-small-ko ONNX (이 PC CPU, --embed e5)
+model_dir = 'D:\Project\SimpleRAG\dist-rust\models\e5-small-ko'
+# CPU 리랭커 (bge-reranker-base, hs_rr 구성)
+reranker_dir = 'D:\Project\SimpleRAG\dist-rust\models\bge-reranker-base-int8'
